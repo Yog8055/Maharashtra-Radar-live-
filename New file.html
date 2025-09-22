@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Maharashtra Live Rain</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <style>
+      body, html { margin: 0; padding: 0; height: 100%; }
+      #map { width: 100%; height: 100%; }
+      .control-box {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        background: white;
+        padding: 6px 10px;
+        border-radius: 6px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        z-index: 1000;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div class="control-box">
+      <button id="toggleRadar">Pause Radar</button>
+    </div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      const map = L.map('map').setView([19.7515, 75.7139], 7);
+
+      // Restrict view to Maharashtra bounds
+      const maharashtraBounds = [
+        [15.6, 72.6], // Southwest
+        [22.2, 81.0]  // Northeast
+      ];
+      map.setMaxBounds(maharashtraBounds);
+      map.on('drag', function() {
+        map.panInsideBounds(maharashtraBounds, { animate: true });
+      });
+
+      // Base Layers
+      const streets = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors'
+      }).addTo(map);
+
+      const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        attribution: 'Tiles &copy; Esri'
+      });
+
+      const clouds = L.tileLayer(
+        "https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=b40030cca79ef7ad5efead9e0f290fc9",
+        {
+          attribution: '&copy; <a href="https://openweathermap.org/">OpenWeather</a>',
+          opacity: 0.6
+        }
+      );
+
+      const baseMaps = { "Streets": streets, "Satellite": satellite, "Clouds": clouds };
+
+      // Overlay Layers
+      const radarLayerGroup = L.layerGroup();
+      const alertsLayer = L.layerGroup();
+      const lightningLayer = L.layerGroup();
+      const floodLayer = L.layerGroup();
+
+      const overlayMaps = {
+        "Radar": radarLayerGroup,
+        "Alerts": alertsLayer,
+        "Lightning": lightningLayer,
+        "Floods": floodLayer
+      };
+
+      L.control.layers(baseMaps, overlayMaps).addTo(map);
+
+      // RainViewer radar animation
+      let radarFrames = [];
+      let radarIndex = 0;
+      let radarTile;
+      let playing = true;
+
+      async function loadRadarFrames() {
+        try {
+          const res = await fetch('https://api.rainviewer.com/public/weather-maps.json');
+          const data = await res.json();
+          radarFrames = data.radar.past.map(f => f.path);
+          if (data.radar.nowcast) {
+            radarFrames = radarFrames.concat(data.radar.nowcast.map(f => f.path));
+          }
+          startRadar();
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      function showRadarFrame(idx) {
+        if (radarTile) radarLayerGroup.removeLayer(radarTile);
+        radarTile = L.tileLayer(`https://tilecache.rainviewer.com/v2/radar/${radarFrames[idx]}/256/{z}/{x}/{y}/2/1_1.png`, {
+          opacity: 0.6,
+          zIndex: 400
+        });
+        radarLayerGroup.addLayer(radarTile);
+      }
+
+      function startRadar() {
+        radarIndex = 0;
+        showRadarFrame(radarIndex);
+        setInterval(() => {
+          if (!playing) return;
+          radarIndex = (radarIndex + 1) % radarFrames.length;
+          showRadarFrame(radarIndex);
+        }, 1000);
+      }
+
+      document.getElementById('toggleRadar').onclick = () => {
+        playing = !playing;
+        document.getElementById('toggleRadar').innerText = playing ? 'Pause Radar' : 'Play Radar';
+      };
+
+      // Load OpenWeather Alerts (districts)
+      const districts = [
+        { name: "Mumbai", lat: 19.076, lon: 72.8777 },
+        { name: "Pune", lat: 18.5204, lon: 73.8567 },
+        { name: "Nagpur", lat: 21.1458, lon: 79.0882 },
+        { name: "Nashik", lat: 19.9975, lon: 73.7898 },
+        { name: "Aurangabad", lat: 19.8762, lon: 75.3433 },
+        { name: "Kolhapur", lat: 16.705, lon: 74.2433 }
+      ];
+
+      async function loadAlerts() {
+        alertsLayer.clearLayers();
+        floodLayer.clearLayers();
+        for (let d of districts) {
+          try {
+            const res = await fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${d.lat}&lon=${d.lon}&appid=b40030cca79ef7ad5efead9e0f290fc9`);
+            const data = await res.json();
+            if (data.weather) {
+              const desc = data.weather.map(w => w.description).join(", ");
+              L.marker([d.lat, d.lon]).bindPopup(`<b>${d.name}</b><br>${desc}`).addTo(alertsLayer);
+
+              if (desc.toLowerCase().includes("flood")) {
+                const circle = L.circle([d.lat, d.lon], {
+                  radius: 20000,
+                  color: "blue",
+                  fillOpacity: 0.3
+                }).bindPopup(`Flood Alert: ${d.name}`);
+                floodLayer.addLayer(circle);
+              }
+            }
+          } catch (e) {
+            console.error("Alert fetch error:", e);
+          }
+        }
+      }
+
+      // Placeholder lightning
+      function loadLightning() {
+        lightningLayer.clearLayers();
+        // Example static lightning strike
+        const strike = L.circleMarker([19.5, 75.7], {
+          radius: 6,
+          color: "yellow",
+          fillColor: "orange",
+          fillOpacity: 0.8
+        }).bindPopup("⚡ Lightning strike (example)");
+        lightningLayer.addLayer(strike);
+      }
+
+      // Auto refresh every 5 minutes
+      function refreshAll() {
+        loadAlerts();
+        loadLightning();
+      }
+
+      loadRadarFrames();
+      refreshAll();
+      setInterval(refreshAll, 5 * 60 * 1000);
+    </script>
+  </body>
+</html>
