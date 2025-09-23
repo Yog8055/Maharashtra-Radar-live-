@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Maharashtra Live Rain & Villages (Lazy Load)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html,body,#map{height:100%; margin:0; padding:0}
+    #map { position: absolute; inset: 60px 0 40px 0; }
+    header {
+      position: absolute; top:0; left:0; right:0; height:60px;
+      background:#004463; color:#fff; display:flex; align-items:center; padding:8px 12px;
+      font-family: Arial, sans-serif; z-index:1000;
+    }
+    footer {
+      position:absolute; bottom:0; left:0; right:0; height:40px;
+      background:#0b3b57; color:#fff; display:flex; align-items:center; padding:6px 12px;
+      font-family: Arial, sans-serif; z-index:1000;
+    }
+    .controls { position:absolute; top:70px; left:12px; z-index:1000; background:rgba(255,255,255,0.95); padding:8px; border-radius:6px;}
+    .info { font-size:13px; color:#222; }
+    .loader { display:inline-block; width:14px; height:14px; border:2px solid #ccc; border-top-color:#0066cc; border-radius:50%; animation:spin 1s linear infinite; margin-left:8px; vertical-align:middle;}
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .message { margin-top:6px; font-size:13px; color:#333; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div style="flex:1">
+    <strong>🌧 Maharashtra Live Rain & Village Tracker</strong>
+    <div style="font-size:12px; opacity:0.9">Zoom to village level to load village boundaries (lazy load)</div>
+  </div>
+  <div style="margin-left:auto; font-size:13px; opacity:0.95">Powered by RainViewer, OpenWeather, OSM</div>
+</header>
+
+<div id="map"></div>
+
+<div class="controls">
+  <div class="info">
+    <div><button id="locateBtn">📍 My location</button>
+      <button id="refreshVillages">🔄 Reload villages</button>
+    </div>
+    <div class="message" id="status">Village loader: idle</div>
+  </div>
+</div>
+
+<footer>
+  <div style="flex:1">Use layers control (top-right) to toggle Rain/Clouds/Districts/Villages</div>
+  <div>Auto-refresh: 5 min • Village lazy-load on zoom ≥ 12</div>
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(async function(){
+  // ========== CONFIG ==========
+  const OPENWEATHER_KEY = "b40030cca79ef7ad5efead9e0f290fc9"; // your key
+  const VILLAGE_ZOOM_THRESHOLD = 12; // when to load villages
+  const GITHUB_RAW_BASE = "https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO/main/villages/"; 
+  // If you upload per-district files to the repo under /villages/<district>.geojson this is the location pattern.
+  // Replace YOUR_GITHUB_USERNAME and YOUR_REPO with your values.
+  // Example final file URL: https://raw.githubusercontent.com/you/repo/main/villages/Pune.geojson
+
+  // ========== MAP INIT ==========
+  const map = L.map('map', { minZoom:6, maxZoom:18 }).setView([19.7515,75.7139], 7);
+
+  // Maharashtra bounds (approx)
+  const MAHARASHTRA_BOUNDS = [[15.6,72.5],[22.2,81.0]];
+  map.setMaxBounds(MAHARASHTRA_BOUNDS);
+
+  // Base layers
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution: '&copy; OpenStreetMap' }).addTo(map);
+  const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{ attribution:'Esri' });
+
+  // OpenWeather overlays (rain / clouds)
+  const rain = L.tileLayer(`https://tile.openweathermap.org/map/precipitation_new/{z}/{x}/{y}.png?appid=${OPENWEATHER_KEY}`, { opacity:0.6, attribution: 'Rain © OpenWeather' });
+  const clouds = L.tileLayer(`https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=${OPENWEATHER_KEY}`, { opacity:0.6, attribution: 'Clouds © OpenWeather' });
+
+  // Helper groups
+  const districtLayerGroup = L.layerGroup().addTo(map);
+  const villageLayerGroup = L.layerGroup().addTo(map);
+  const floodLayerGroup = L.layerGroup().addTo(map); // central flood polygons
+  const alertMarkersGroup = L.layerGroup().addTo(map);
+
+  // Controls
+  const baseMaps = { "Default": osm, "Satellite": satellite };
+  const overlays = { "☔ Rain": rain, "☁ Clouds": clouds, "🟩 Districts": districtLayerGroup, "🏘 Villages": villageLayerGroup, "🚨 Flood Zones": floodLayerGroup, "⚠ Alerts": alertMarkersGroup };
+  L.control.layers(baseMaps, overlays, { collapsed: false }).addTo(map);
+
+  // Status DOM
+  const status = document.getElementById('status');
+  function setStatus(txt, busy=false){
+    status.innerHTML = txt + (busy? ' <span class="loader"></span>':'');
+  }
+
+  // ========== DISTRICTS ==========
+  // (Replace with a real MA district GeoJSON raw URL if you have one - example uses DataMeet repo)
+  const DISTRICT_GEOJSON_URL = "https://raw.githubusercontent.com/datameet/maps/master/States/Maharashtra/maharashtra_district.geojson";
+  let districtGeojson = null;
+  try {
+    setStatus('Loading district boundaries...', true);
+    const r = await fetch(DISTRICT_GEOJSON_URL);
+    districtGeojson = await r.json();
+    L.geoJSON(districtGeojson, {
+      style: { color:'green', weight:1, fillOpacity:0 },
+      onEachFeature: function(feature, layer){
+        const name = feature.properties && (feature.properties.DISTRICT || feature.properties.district || feature.properties.NAME || feature.properties.name) || "Unknown";
+        layer.bindPopup(`<b>District:</b> ${name}`);
+        layer.on('click', ()=> {
+          // when user clicks district we zoom and trigger village load for that district
+          map.fitBounds(layer.getBounds());
+          loadVillagesForDistrict(name, layer.getBounds());
+        });
+      }
+    }).addTo(districtLayerGroup);
+    setStatus('District boundaries loaded.');
+  } catch(e){
+    console.error("District load failed", e);
+    setStatus('Failed to load districts — villages will attempt to load by search.');
+  }
+
+  // ========== CENTRAL MAHARASHTRA FLOOD POLYGONS (demo) ==========
+  // You should replace with real polygons (from state/NDMA) when available.
+  const demoFloodZones = {
+    "type":"FeatureCollection","features":[
+      {"type":"Feature","properties":{"name":"Ahmednagar Flood Zone"},"geometry":{"type":"Polygon","coordinates":[[[75.0,19.0],[75.5,19.0],[75.5,19.4],[75.0,19.4],[75.0,19.0]]]}},
+      {"type":"Feature","properties":{"name":"Solapur Flood Zone"},"geometry":{"type":"Polygon","coordinates":[[[75.6,17.8],[76.0,17.8],[76.0,18.2],[75.6,18.2],[75.6,17.8]]]}}
+    ]
+  };
+  L.geoJSON(demoFloodZones, { style:{ color:'blue', fillOpacity:0.25, weight:1 } }).addTo(floodLayerGroup);
+
+  // ========== VILLAGE LOADING LOGIC ==========
+  // caching loaded districts to avoid re-fetching
+  const loadedDistricts = new Set();
+
+  // helper: create GitHub raw URL for district file
+  function districtVillageUrlFromName(districtName){
+    // sanitize and produce file name e.g. Pune -> Pune.geojson
+    const filename = encodeURIComponent(districtName.replace(/\s+/g,'_')) + ".geojson";
+    return GITHUB_RAW_BASE + filename;
+  }
+
+  async function tryLoadVillageFileFromGithub(districtName){
+    const url = districtVillageUrlFromName(districtName);
+    setStatus(`Trying to load villages for ${districtName} from GitHub...`, true);
+    try {
+      const resp = await fetch(url);
+      if(!resp.ok) throw new Error("not found");
+      const geo = await resp.json();
+      // add to map
+      const layer = L.geoJSON(geo, {
+        style: { color:'#ff8c00', weight:1, fillOpacity:0.15 },
+        onEachFeature: (f,l) => {
+          const n = f.properties && (f.properties.NAME || f.properties.name || f.properties.VILLAGE || "Village");
+          l.bindPopup(`<b>Village:</b> ${n || 'Unknown'}`);
+        }
+      });
+      villageLayerGroup.clearLayers();
+      villageLayerGroup.addLayer(layer);
+      setStatus(`Villages loaded for ${districtName} (from GitHub).`);
+      loadedDistricts.add(districtName);
+      return true;
+    } catch(err){
+      console.warn("GitHub file missing or failed:", err);
+      return false;
+    }
+  }
+
+  // fallback: fetch from Overpass API (OSM). This attempts to get admin/boundary features near district bbox
+  async function tryLoadVillagesFromOverpass(bounds, districtName){
+    setStatus(`Attempting to load villages for ${districtName} from Overpass (OSM)...`, true);
+    // Overpass bbox format: south,west,north,east
+    const s = bounds.getSouth(); const w = bounds.getWest(); const n = bounds.getNorth(); const e = bounds.getEast();
+    // Query: try village-level relations/ways (admin_level=10/11) and place=village nodes
+    const query = `[out:json][timeout:60];
+      (
+        relation["boundary"="administrative"]["admin_level"~"10|11"](${s},${w},${n},${e});
+        way["boundary"="administrative"]["admin_level"~"10|11"](${s},${w},${n},${e});
+        node["place"="village"](${s},${w},${n},${e});
+      );
+      out body; >; out skel qt;`;
+    const url = "https://overpass-api.de/api/interpreter";
+    try {
+      const res = await fetch(url, { method: "POST", body: query, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }});
+      const json = await res.json();
+      // convert Overpass JSON to GeoJSON (simple converter for relations/ways/nodes)
+      const geo = overpassToGeoJSON(json);
+      if(!geo || !geo.features || geo.features.length==0) {
+        setStatus('Overpass returned no village polygons for this area.');
+        return false;
+      }
+      villageLayerGroup.clearLayers();
+      L.geoJSON(geo, {
+        style: { color:'#ff8c00', weight:1, fillOpacity:0.12 },
+        onEachFeature: (f,l) => {
+          const n = f.properties && (f.properties.name || f.properties.NAME || f.properties.village || 'Village');
+          l.bindPopup(`<b>Village:</b> ${n}`);
+        }
+      }).addTo(villageLayerGroup);
+      setStatus(`Villages loaded for ${districtName} (from OSM).`);
+      loadedDistricts.add(districtName);
+      return true;
+    } catch(e){
+      console.error("Overpass error", e);
+      setStatus('Overpass fetch failed.');
+      return false;
+    }
+  }
+
+  // Simple Overpass -> GeoJSON converter (handles nodes + ways + relations to some extent)
+  // Note: This is a minimal converter. For robust production use, use osmtogeojson library or a server-side converter.
+  function overpassToGeoJSON(osm){
+    if(!osm || !osm.elements) return null;
+    const nodes = {};
+    for(const el of osm.elements){
+      if(el.type === 'node') nodes[el.id] = [el.lon, el.lat];
+    }
+    const features = [];
+    for(const el of osm.elements){
+      if(el.type === 'way' && el.nodes){
+        const coords = el.nodes.map(id => nodes[id]).filter(Boolean);
+        if(coords.length>1){
+          features.push({
+            type:'Feature',
+            properties: { id: el.id, name: el.tags && (el.tags.name || el.tags.NA) || null, tags: el.tags },
+            geometry: { type: 'Polygon', coordinates: [coords] }
+          });
+        }
+      } else if(el.type === 'node' && el.tags && el.tags.place === 'village'){
+        features.push({
+          type:'Feature',
+          properties: { id: el.id, name: el.tags.name || 'village', tags: el.tags },
+          geometry: { type:'Point', coordinates: [el.lon, el.lat] }
+        });
+      } else if(el.type === 'relation' && el.members){
+        // try to build a polygon from members (very naive)
+        const rings = [];
+        for(const mem of el.members){
+          if(mem.type==='way' && mem.role!=='outer' && mem.role!=='inner') continue;
+          // collect nodes for way from elements (we don't have nodes mapping for relation members here)
+        }
+        // skip complex relation handling in this lightweight converter
+      }
+    }
+    return { type:'FeatureCollection', features: features };
+  }
+
+  // Primary function to load villages for a district (name and bounds provided)
+  async function loadVillagesForDistrict(districtName, bounds){
+    if(loadedDistricts.has(districtName)) { setStatus(`${districtName} already loaded.`); return; }
+    setStatus(`Preparing to load villages for ${districtName}...`, true);
+
+    // 1) try GitHub raw per-district file
+    const okGithub = await tryLoadVillageFileFromGithub(districtName);
+    if(okGithub) return;
+
+    // 2) fallback to Overpass (OSM)
+    const okOverpass = await tryLoadVillagesFromOverpass(bounds, districtName);
+    if(okOverpass) return;
+
+    // 3) final fallback: show message and keep demo polygon if needed
+    setStatus(`No village data found for ${districtName}. You can upload ${districtName}.geojson to your repo /villages/ directory.`, false);
+  }
+
+  // ========== AUTO TRIGGER ON ZOOM / MOVE ==========
+  let zoomTimer = null;
+  map.on('zoomend moveend', function(){
+    clearTimeout(zoomTimer);
+    zoomTimer = setTimeout(async ()=>{
+      if(map.getZoom() >= VILLAGE_ZOOM_THRESHOLD){
+        // find district feature containing center point (if district geo was loaded)
+        const center = map.getCenter();
+        let foundDistrict = null;
+        if(districtGeojson && districtGeojson.features){
+          for(const f of districtGeojson.features){
+            const layer = L.geoJSON(f);
+            if(layer && layer.getBounds && layer.getBounds().contains(center)){
+              // property name extraction
+              const name = f.properties && (f.properties.DISTRICT || f.properties.district || f.properties.NAME || f.properties.name) || null;
+              foundDistrict = { name: name || 'Unknown', bounds: layer.getBounds() };
+              break;
+            }
+          }
+        }
+        if(foundDistrict){
+          await loadVillagesForDistrict(foundDistrict.name, foundDistrict.bounds);
+        } else {
+          setStatus('Zoom to a district area (or click a district) to load villages.');
+        }
+      } else {
+        // zoomed out -> clear village layer
+        // (keep loaded cache to avoid re-fetching)
+        villageLayerGroup.clearLayers();
+        setStatus('Zoom in to load villages.');
+      }
+    }, 500);
+  });
+
+  // manual reload button
+  document.getElementById('refreshVillages').onclick = function(){
+    // clear and re-trigger
+    villageLayerGroup.clearLayers();
+    loadedDistricts.clear();
+    setStatus('Village cache cleared; zoom to district to reload.');
+  };
+
+  // locate button
+  document.getElementById('locateBtn').onclick = function(){
+    if(navigator.geolocation){
+      setStatus('Requesting location...', true);
+      navigator.geolocation.getCurrentPosition(pos=>{
+        const lat = pos.coords.latitude, lon = pos.coords.longitude;
+        L.circleMarker([lat,lon], { radius:7, color:'#0066cc', fillColor:'#3399ff', fillOpacity:0.9 }).addTo(map).bindPopup('📍 You are here').openPopup();
+        map.setView([lat,lon], 13);
+        setStatus('Centered on your location.');
+      }, err=>{
+        setStatus('Location access denied or unavailable.');
+      }, { enableHighAccuracy:true, timeout:10000 });
+    } else {
+      setStatus('Geolocation not supported.');
+    }
+  };
+
+  // ========== LIVE ALERTS (OpenWeather OneCall alerts for district centers) ==========
+  async function loadOpenWeatherAlertsForDistricts(){
+    alertMarkersGroup.clearLayers();
+    // iterate districtGeojson features and query alerts at feature centroid
+    if(!districtGeojson || !districtGeojson.features) return;
+    setStatus('Fetching OpenWeather alerts for districts...', true);
+    try {
+      for(const f of districtGeojson.features){
+        const props = f.properties || {};
+        const name = props.DISTRICT || props.district || props.NAME || props.name || 'Unknown';
+        // compute centroid (simple bbox centroid)
+        const layer = L.geoJSON(f);
+        const c = layer.getBounds().getCenter();
+        const lat = c.lat, lon = c.lng;
+        try {
+          const url = `https://api.openweathermap.org/data/3.0/onecall?lat=${lat}&lon=${lon}&exclude=minutely,hourly,daily,current&appid=${OPENWEATHER_KEY}`;
+          const r = await fetch(url);
+          if(!r.ok) continue;
+          const data = await r.json();
+          if(data.alerts && data.alerts.length){
+            for(const alert of data.alerts){
+              if(alert.event.toLowerCase().includes('flood') || alert.tags && alert.tags.includes('flood')){
+                const m = L.marker([lat, lon], { title: `Alert: ${alert.event}` }).bindPopup(`<b>${name} — ${alert.event}</b><br>${alert.description || ''}<br><small>Valid until: ${alert.end?new Date(alert.end*1000).toLocaleString():'n/a'}</small>`);
+                m.addTo(alertMarkersGroup);
+                // optionally highlight affected district polygon
+                // find district layer and style it (we'll highlight using districtLayerGroup)
+                // (skipped here for safety; could be added)
+              }
+            }
+          }
+        } catch(e){ console.debug('alert fetch fail for district', name, e); }
+      }
+      setStatus('OpenWeather district alerts loaded.', false);
+    } catch(e){
+      console.error('alert load failure', e);
+      setStatus('Failed to fetch OpenWeather alerts.', false);
+    }
+  }
+
+  // initial alerts load + periodic refresh
+  await loadOpenWeatherAlertsForDistricts();
+  setInterval(loadOpenWeatherAlertsForDistricts, 5*60*1000);
+
+  // ========== NOTES & HELP ==========
+  // Helpful message if user wants best performance:
+  // - Prepare per-district village GeoJSON files and upload to your GitHub repo under /villages/<District>.geojson
+  // - The page will try to load https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO/main/villages/<District>.geojson
+  // - Per-district files keep size manageable and load quickly.
+  setStatus('Ready. Zoom to a district (zoom ≥ '+VILLAGE_ZOOM_THRESHOLD+') to load villages.');
+})();
+</script>
+</body>
+</html>
